@@ -4,6 +4,7 @@ Mapping of image voxel coordinates to world space.
 
 from __future__ import annotations
 
+import math
 import torch
 import voxel as vx
 
@@ -36,7 +37,16 @@ class AcquisitionGeometry(vx.AffineMatrix):
         super().__init__(matrix, device)
         self._baseshape = torch.Size(baseshape)
         self._explicit_slice_direction = slice_direction
-        self.metadata = {}
+
+        # the IO 'reference' is used to cache information that is supported by an original image
+        # file but not by this class. for example, it is useful for loading and saving file
+        # formats that do not explicitly represent the geometry with a voxel-to-world matrix,
+        # such as the MGH format. at save-time, if the geometry encoded by this class is similar
+        # to that of a cached reference, we instead use the reference header information while
+        # saving. this avoids the floating point drift that would otherwise occur during successive
+        # reads and writes. this class will propagate any included reference information for
+        # functions in which the underlying geometry does not change
+        self.reference = {}
 
     def __setitem__(self, indexing, item):
         """
@@ -58,19 +68,32 @@ class AcquisitionGeometry(vx.AffineMatrix):
         """
         return self._baseshape
 
-    def new(self, baseshape: torch.Size) -> AcquisitionGeometry:
+    def _from_new_properties(self,
+        baseshape: torch.Size = None,
+        matrix: torch.Tensor = None,
+        keep_explicit_slice_direction: bool = True,
+        keep_reference: bool = False,
+        ) -> AcquisitionGeometry:
         """
-        Create a new geometry with a different spatial shape but the same
-        affine transform and slice direction.
-
-        Args:
-            baseshape (Size): New spatial shape.
-
-        Returns:
-            AcquisitionGeometry: New geometry with the specified shape.
+        A private utility to construct a new geometry with certain propagated information.
         """
-        return AcquisitionGeometry(baseshape, self.tensor,
-                                   slice_direction=self._explicit_slice_direction)
+        geometry = AcquisitionGeometry(
+            baseshape=self.baseshape if baseshape is None else baseshape,
+            matrix=self.tensor if matrix is None else matrix,
+            slice_direction=self._explicit_slice_direction if keep_explicit_slice_direction else None)
+
+        # shallow copy of the reference cache
+        if keep_reference:
+            geometry.reference = geometry.reference.copy()
+
+        return geometry
+
+    def _from_tensor_with_new_properties(self, tensor: torch.Tensor) -> AcquisitionGeometry:
+        """
+        A necessary utility to reimplement when subclassing the AffineMatrix in order to
+        support methods such as matrix tensor detaching, device moving, etc.
+        """
+        return self._from_new_properties(matrix=tensor, keep_reference=True)
 
     def numel(self) -> int:
         """
@@ -95,6 +118,14 @@ class AcquisitionGeometry(vx.AffineMatrix):
             return self._explicit_slice_direction
         else:
             return self.spacing.argmax()
+
+    @property
+    def slice_direction_is_explicit(self) -> bool:
+        """
+        Whether or not the slice direction was explicitly set at
+        construction or inferred through heuristics.
+        """
+        return self._explicit_slice_direction is not None
 
     @vx.caching.cached
     def in_plane_directions(self) -> list:
@@ -144,6 +175,38 @@ class AcquisitionGeometry(vx.AffineMatrix):
         Anatomical orientation of the voxel coordinate system.
         """
         return Orientation(self)
+
+    @vx.caching.cached
+    def fov(self) -> torch.Tensor:
+        """
+        Acquisition field of view in world coordinate space.
+        """
+        return self.voxel_to_world_units(torch.tensor(self.baseshape, device=self.device))
+
+    @vx.caching.cached
+    def origin(self) -> torch.Tensor:
+        """
+        Origin coordinate of the acquisition grid in world space.
+        """
+        return self.transform(torch.zeros(3, device=self.device))
+
+    @vx.caching.cached
+    def center(self) -> torch.Tensor:
+        """
+        Center coordinate of the acquisition grid in world space.
+        """
+        return self.transform((torch.tensor(self.baseshape, device=self.device) - 1) / 2)
+
+    def voxel_to_local_coordinates(self, coords: torch.Tensor) -> torch.Tensor:
+        """
+        Transform voxel coordiates to flipped local grid coordinates in
+        the range [-1, 1]. These local coordinates are used for grid sampling in torch.
+
+        Returns:
+            torch.Tensor: Transformed local coordinates.
+        """
+        shape = torch.tensor(self.baseshape).to(coords.device)
+        return ((2 * coords + 1) / shape - 1).flip(-1)
 
     def world_to_voxel_units(self, units: torch.Tensor) -> torch.Tensor:
         """
@@ -199,15 +262,7 @@ class AcquisitionGeometry(vx.AffineMatrix):
         elif vx.Space(source) == 'voxel' and vx.Space(target) == 'world':
             units = self.voxel_to_world_units(units)
 
-        if units.ndim == 0:
-            units = units.repeat((3, num)) if num is not None else units.repeat(3)
-        elif units.shape == (3,) and num is not None:
-            units = units.unsqueeze(1).repeat(1, 2)
-        if num is not None and units.shape != (3, num):
-            raise ValueError(f'tensor must be of size (3, {num}) or (3,) or (1,), got {units.shape}')
-        if num is None and units.shape != (3,):
-            raise ValueError(f'tensor must be of size (3,) or (1,), got {units.shape}')
-        return units
+        return vx.slicing.conform_coordinates(units, num)
 
     def shift(self, delta: float | torch.Tensor, space: vx.Space) -> AcquisitionGeometry:
         """
@@ -222,9 +277,23 @@ class AcquisitionGeometry(vx.AffineMatrix):
         """
         trf = vx.affine.translation_matrix(torch.as_tensor(delta, device=self.device))
         matrix = trf @ self if vx.Space(space) =='world' else self @ trf
-        geometry = AcquisitionGeometry(self.baseshape, matrix,
-                                       slice_direction=self._explicit_slice_direction)
-        return geometry
+        return self._from_new_properties(matrix=matrix)
+    
+    def shift_to_point(self, target: torch.Tensor, center: bool = True) -> AcquisitionGeometry:
+        """
+        Shift the geometry so that the center or origin maps to a target world coordinate.
+
+        Args:
+            target (Tensor): Target coordinate to shift to.
+            center (bool): If True, shift the center to the target point. Otherwise,
+                shift the origin to the target.
+
+        Returns:
+            AcquisitionGeometry: The shifted geometry.
+        """
+        target = torch.as_tensor(target, device=self.device)
+        current = self.center if center else self.origin
+        return self.shift(target - current, space='world')
 
     def scale(self, factor: float | torch.Tensor, space: vx.Space) -> AcquisitionGeometry:
         """
@@ -241,9 +310,7 @@ class AcquisitionGeometry(vx.AffineMatrix):
         diag[:3] = torch.as_tensor(factor, device=self.device)
         trf = torch.diag(diag)
         matrix = trf @ self.tensor if vx.Space(space) =='world' else self.tensor @ trf
-        geometry = AcquisitionGeometry(self.baseshape, matrix,
-                                       slice_direction=self._explicit_slice_direction)
-        return geometry
+        return self._from_new_properties(matrix=matrix)
 
     def rotate(self,
         rotation: torch.Tensor,
@@ -267,6 +334,7 @@ class AcquisitionGeometry(vx.AffineMatrix):
         """
         rotation = torch.as_tensor(rotation, device=self.device)
         trf = vx.affine.angles_to_rotation_matrix(rotation, degrees=degrees)
+
         if vx.Space(space) == 'world':
             matrix = trf @ self
         elif not corner:
@@ -275,9 +343,8 @@ class AcquisitionGeometry(vx.AffineMatrix):
             matrix = self @ trf
         else:
             matrix = self @ trf
-        geometry = AcquisitionGeometry(self.baseshape, matrix,
-                                       slice_direction=self._explicit_slice_direction)
-        return geometry
+
+        return self._from_new_properties(matrix=matrix)
 
     def reorient(self, target: vx.Orientation) -> AcquisitionGeometry:
         """
@@ -301,10 +368,10 @@ class AcquisitionGeometry(vx.AffineMatrix):
         trf[:3, -1] = (baseshape - 1) * (flip < 0)
 
         slice_direction = None
-        if self._explicit_slice_direction is not None:
+        if self.slice_direction_is_explicit:
             slice_direction = perm.argsort()[self.slice_direction]
 
-        return AcquisitionGeometry(baseshape[perm], self @ trf, slice_direction=slice_direction)
+        return AcquisitionGeometry(baseshape[perm], self @ trf.to(self.device), slice_direction=slice_direction)
 
     def resample(self,
         spacing: float | torch.Tensor = None,
@@ -325,10 +392,10 @@ class AcquisitionGeometry(vx.AffineMatrix):
             AcquisitionGeometry: Resampled geometry.
         """
         if spacing is None and in_plane_spacing is None and slice_spacing is None:
-            raise ValueError('must provide either spacing, in_plane_spacing, or slice_spacing')
+            raise ValueError('must set target spacing, in_plane_spacing, or slice_spacing')
         if spacing is not None:
             if in_plane_spacing is not None or slice_spacing is not None:
-                raise ValueError('cannot provide spacing with in_plane_spacing or slice_spacing')
+                raise ValueError('cannot set spacing and in_plane_spacing, slice_spacing')
         else:
             spacing = self.spacing.clone()
             if in_plane_spacing is not None:
@@ -344,17 +411,83 @@ class AcquisitionGeometry(vx.AffineMatrix):
             raise ValueError(f'expected 3D spacing, got {spacing.ndim}D')
 
         # compute new shapes and lengths of the new grid (we'll round up here to avoid losing any signal)
-        curshape = torch.tensor(self.baseshape, dtype=torch.float32)
+        spacing = spacing.to(self.device)
+        curshape = torch.tensor(self.baseshape, dtype=torch.float32, device=spacing.device)
         newshape = (self.spacing * curshape / spacing).ceil().int()
 
         # determine the new geometry
         scale = spacing / self.spacing
         shift = 0.5 * scale * (1 - newshape / curshape)
         matrix = self.shift(shift, space='voxel').scale(scale, space='voxel')
-        geometry = vx.AcquisitionGeometry(newshape, matrix)
-        return geometry
 
-    def reshape(self, baseshape: torch.Size) -> AcquisitionGeometry:
+        # we should only transfer an explicit slice direction if the new spacing was
+        # designated directly by a target in-plane and/or slice spacing
+        slice_direction = None
+        if self.slice_direction_is_explicit and (in_plane_spacing is not None or slice_spacing is not None):
+            slice_direction = self.slice_direction
+
+        return vx.AcquisitionGeometry(newshape, matrix, slice_direction=slice_direction)
+
+    def pool(self,
+        scale: int = 2,
+        spacing_ratio_thresh: float = None) -> AcquisitionGeometry:
+        """
+        Pool the geometry with a sliding window.
+
+        By default, this will pool over all dimensions, but it can be conditionally
+        disabled for the slice dimension based on the ratio of slice vs in-plane spacing, 
+        i.e. the value of `geometry.spacing_ratio`. For example, if the slice spacing is
+        `spacing_ratio_thresh` times greater than the in-plane spacing, the slice dimension
+        will not be pooled. Mind that if the resulting pooled volume has a slice spacing
+        less than the in-plane spacing, it will be resampled to an isotropic resolution.
+
+        There is no analogous `unpool` method because there is complexity in determining
+        the desired unpooling strategy. To return to the original geometry, instead use
+        the `resample_like` method. If no reference geometry is available, just use
+        the `reshape` method to upsample.
+
+        Note that this implementation must mirror the pooling operation used by the volume
+        class. Any changes to the pooling operation in one class must be reflected in the other.
+
+        Args:
+            scale (int, optional): The size of the pooling window. Defaults to 2.
+            spacing_ratio_thresh (float, optional): Slice spacing ration that determines
+                whether the slice dimension is pooled. This is disabled by default.
+
+        Returns:
+            AcquisitionGeometry: Pooled geometry.
+        """
+
+        # dowsample factors for each dimension
+        factors = [1 if d == 1 else scale for d in self.baseshape]
+
+        # check if we should pool the slice dimension based on the spacing ratio threshold
+        slice_dim_pooling = spacing_ratio_thresh is None or self.spacing_ratio < spacing_ratio_thresh
+
+        if not slice_dim_pooling:
+            factors[self.geometry.slice_direction] = 1
+
+        pooled_shape = [math.ceil(s / f) for s, f in zip(self.baseshape, factors)]
+
+        # adjust the geometry based on the pooling factors
+        shift = [0.5 * (f - 1) for f in factors]
+        adjusted = self.shift(shift, space='voxel').scale(factors, space='voxel')
+        pooled = vx.AcquisitionGeometry(pooled_shape, adjusted)
+
+        # if the slice dimension was not pooled and the resulting slice spacing
+        # is less than the in-plane spacing, we need to resample the slice dimension
+        if not slice_dim_pooling and self.spacing_ratio < scale:
+            spacing = pooled.geometry.spacing.clone()
+            spacing[self.geometry.slice_direction] = spacing[self.geometry.in_plane_directions].mean()
+            pooled = pooled.resample(spacing)
+
+        # sanity check
+        if pooled.spacing_ratio < 0.99:
+            raise ValueError('unexpected spacing ratio after pooling operation')
+
+        return pooled
+
+    def reshape(self, baseshape: torch.Size, from_origin: bool = False) -> AcquisitionGeometry:
         """
         Modify the spatial extent of the volume geometry, cropping or padding around the
         center image to fit a given **baseshape**.
@@ -364,12 +497,21 @@ class AcquisitionGeometry(vx.AffineMatrix):
 
         args:
             baseshape (Size): Target spatial (3D) shape.
+            from_origin (bool, optional): If True, padding or cropped will be done
+                at the ends of the image shape and not centered.
         
         returns:
             AcquisitionGeometry: Reshaped geometry.
         """
+        baseshape = torch.Size(baseshape)
+        if baseshape == self.baseshape:
+            return self
+
+        if from_origin:
+            return self._from_new_properties(baseshape=baseshape, keep_reference=True)
+
         shift = (torch.tensor(self.baseshape) - torch.tensor(baseshape)) // 2
-        return self.shift(shift, space='voxel').new(baseshape)
+        return self.shift(shift, space='voxel').reshape(baseshape, from_origin=True)
 
     def pad(self, margin: float | torch.Tensor, space: vx.Space) -> AcquisitionGeometry:
         """
@@ -385,9 +527,9 @@ class AcquisitionGeometry(vx.AffineMatrix):
         returns:
             AcquisitionGeometry: Reshaped volume geometry.
         """
-        margin = self.conform_units(margin, space, 'voxel', 2).round().int()
+        margin = self.conform_units(margin, space, 'voxel', 2).cpu().round().int()
         new_shape = torch.tensor(self.baseshape) + margin.sum(-1)
-        return self.shift(-margin[:, 0], space='voxel').new(new_shape)
+        return self.shift(-margin[:, 0], space='voxel').reshape(new_shape, from_origin=True)
 
     def trim(self, margin: float | torch.Tensor, space: vx.Space) -> AcquisitionGeometry:
         """
@@ -403,7 +545,7 @@ class AcquisitionGeometry(vx.AffineMatrix):
         returns:
             AcquisitionGeometry: Reshaped volume geometry.
         """
-        return self.pad(-margin, space)
+        return self.pad(-torch.as_tensor(margin), space)
 
     def bounds(self,
         margin: float | torch.Tensor = None,
@@ -457,21 +599,7 @@ class AcquisitionGeometry(vx.AffineMatrix):
             minc -= margin[:, 0]
             maxc += margin[:, 1]
 
-        return self.shift(minc, 'voxel').new(maxc - minc)
-
-    def voxel_to_local(self) -> vx.AffineMatrix:
-        """
-        Transform that converts voxel coordiates to flipped local grid coordinates in
-        the range [-1, 1]. These local coordinates are used for grid sampling in torch.
-
-        Returns:
-            AffineMatrix: Transformed local coordinates.
-        """
-        mat = torch.eye(4)
-        mat[:3, :3] *= 2 / (torch.tensor(self.baseshape) - 1)
-        mat[:3, -1] = -1
-        mat[[0, 2]] = mat[[2, 0]]
-        return vx.AffineMatrix(mat)
+        return self.shift(minc, 'voxel').reshape(maxc - minc, from_origin=True)
 
     def zeros_like(self,
         channels: int = 1,
@@ -612,7 +740,7 @@ class Orientation:
             self.flip = torch.as_tensor([-1, 1, -1, 1, -1, 1])[indices]
 
         elif isinstance(item, vx.AffineMatrix):
-            tensor = item[:3, :3]
+            tensor = item[:3, :3].detach().cpu()
             # self.dims = tensor.abs().argmax(1)
             # self.flip = tensor[tensor.abs().argmax(0), [0, 1, 2]].sign().int()
             self.dims = tensor.abs().argmax(0)

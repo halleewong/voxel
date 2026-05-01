@@ -4,8 +4,14 @@ Affine transforms in three dimensions.
 
 from __future__ import annotations
 
+from typing import TypeVar
+
+import os
 import torch
 import voxel as vx
+
+
+T = TypeVar('T', bound='AffineMatrix')
 
 
 class AffineMatrix:
@@ -62,13 +68,74 @@ class AffineMatrix:
         tensor_str = tensor_str.replace('\n', f'\n{" " * (len(name) + 1)}')
         return f'{name}({tensor_str})'
 
-    def __matmul__(self, other: AffineMatrix | torch.Tensor) -> AffineMatrix | torch.Tensor:
-        isaffine = isinstance(other, AffineMatrix) or \
-                    (torch.is_tensor(other) and other.shape == (4, 4))
-        if isaffine:
-            other = AffineMatrix(other).tensor
-        result = self.tensor.to(other.device) @ other.type(self.tensor.dtype)
-        return AffineMatrix(result) if isaffine else result
+    def __matmul__(self, rhs: AffineMatrix | torch.Tensor) -> AffineMatrix | torch.Tensor:
+        rhs = rhs.tensor if isinstance(rhs, AffineMatrix) else rhs
+        result = self.tensor @ rhs.type(self.tensor.dtype)
+        return AffineMatrix(result) if result.shape == (4, 4) else result
+
+    def __rmatmul__(self, lhs: AffineMatrix | torch.Tensor) -> AffineMatrix | torch.Tensor:
+        lhs = lhs.tensor if isinstance(lhs, AffineMatrix) else lhs
+        result = lhs.type(self.tensor.dtype) @ self.tensor
+        return AffineMatrix(result) if result.shape == (4, 4) else result
+
+    def _from_tensor_with_new_properties(self: T, tensor: torch.Tensor) -> T:
+        """
+        Base class utility function that creates a new object instance, with a
+        new matrix tensor, but the same metadata. This should be reimplemented
+        for subclasses. This function should be called in scenarios only when the
+        matrix has new properties (e.g. device or data type), not new values.
+        """
+        return self.__class__(tensor)
+
+    def save(self, filename: os.PathLike, fmt: str = None) -> None:
+        """
+        Save the affine matrix to a file.
+
+        Args:
+            filename (PathLike): The path to the file to save.
+            fmt (str, optional): The format of the file. If None, the format is
+                determined by the file extension.
+        """
+        vx.save_affine(self, filename, fmt=fmt)
+
+    def detach(self: T) -> T:
+        """
+        Detach the matrix tensor from the current computational graph.
+
+        Returns:
+            A new affine with the detached matrix tensor.
+        """
+        return self._from_tensor_with_new_properties(self.tensor.detach())
+
+    def to(self: T, device: torch.Device) -> T:
+        """
+        Move the matrix tensor to a device.
+
+        Args:
+            device (Device): The target device.
+
+        Returns:
+            A new affine with the matrix tensor on the target device.
+        """
+        return self._from_tensor_with_new_properties(self.tensor.to(device))
+
+    def cuda(self: T) -> T:
+        """
+        Move the matrix tensor to the GPU.
+
+        Returns:
+            A new affine with the matrix tensor on the GPU.
+        """
+        return self._from_tensor_with_new_properties(self.tensor.cuda())
+
+    def cpu(self: T) -> T:
+        """
+        Move the matrix tensor to the CPU.
+
+        Returns:
+            A new affine with the matrix tensor on the CPU.
+        """
+        return self._from_tensor_with_new_properties(self.tensor.cpu())
 
     def inverse(self) -> AffineMatrix:
         """
@@ -93,7 +160,7 @@ class AffineMatrix:
             raise ValueError('Coordinates must have a last dimension of size 3.')
 
         # reshape to a 2D tensor for the transformation
-        coords_reshaped = coords.view(-1, 3)
+        coords_reshaped = coords.reshape(-1, 3)
 
         # convert to homogeneous coordinates
         ones = torch.ones((coords_reshaped.shape[0], 1), dtype=coords.dtype, device=coords.device)
@@ -101,7 +168,7 @@ class AffineMatrix:
 
         # apply the transformation, convert back to cartesian, and reshape
         transformed_coords = coords_homogeneous @ self.tensor.T.to(coords.device)
-        return transformed_coords[:, :3].view(coords.shape)
+        return transformed_coords[:, :3].reshape(coords.shape)
 
 
 class AffineVolumeTransform(AffineMatrix):
@@ -348,15 +415,25 @@ def random_affine(
     Returns:
         AffineMatrix: Random affine matrix.
     """
-    translation_range = sorted([-max_translation, max_translation])
-    translation = torch.distributions.uniform.Uniform(*translation_range).sample((3,))
+    translation = None
+    if max_translation < 0:
+        raise ValueError('max_translation must be a positive value')
+    if max_translation > 0:
+        translation_range = sorted([-max_translation, max_translation])
+        translation = torch.distributions.uniform.Uniform(*translation_range).sample((3,))
 
-    rotation_range = sorted([-max_rotation, max_rotation])
-    rotation = torch.distributions.uniform.Uniform(*rotation_range).sample((3,))
+    rotation = None
+    if max_rotation < 0:
+        raise ValueError('max_rotation must be a positive value')
+    if max_rotation > 0:
+        rotation_range = sorted([-max_rotation, max_rotation])
+        rotation = torch.distributions.uniform.Uniform(*rotation_range).sample((3,))
 
+    scale = None
     if max_scaling < 0:
         raise ValueError('max_scaling must be a positive value')
-    scale = (1 + torch.rand(3) * max_scaling) ** torch.randn(3).sign()
+    if max_scaling > 0:
+        scale = (1 + torch.rand(3) * max_scaling) ** torch.randn(3).sign()
 
     aff = compose_affine(
         translation=translation,

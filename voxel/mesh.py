@@ -153,7 +153,7 @@ class Mesh:
         Vertex cross-product with shape (F, 3).
         """
         vecs = torch.diff(self.triangles, dim=1)
-        return torch.cross(vecs[:, 0], vecs[:, 1])
+        return torch.cross(vecs[:, 0], vecs[:, 1], dim=1)
 
     @vx.caching.cached_transferable
     def edges(self) -> torch.Tensor:
@@ -200,7 +200,6 @@ class Mesh:
         """
         Indices that extract all unique edges from the directional edge list.
         """
-        device = self.faces.device
         aligned = self.edges.sort(dim=1)[0]
 
         # this is a way to do lexsort in pytorch, which is faster
@@ -209,6 +208,7 @@ class Mesh:
         order = idx.gather(-1, aligned[:, 0].gather(-1, idx).argsort(dim=-1, stable=True))
 
         pef = aligned[order]
+        device = self.faces.device
         shift = torch.cat([torch.tensor([True], device=device),
                            torch.any(pef[1:] != pef[:-1], dim=-1),
                            torch.tensor([True], device=device)])
@@ -217,7 +217,12 @@ class Mesh:
                                            (matched[1:] - matched[:-1]))
         reverse = repeated[order.argsort()]
         indices = order[matched[:-1]]
-        return indices, reverse
+
+        repeats = torch.all(pef[:-1] == pef[1:], dim=-1)
+        matched = repeats.nonzero(as_tuple=False).squeeze(-1)
+        bidir_indices = order[torch.stack([matched, matched + 1], dim=1)]
+
+        return indices, reverse, bidir_indices
 
     @vx.caching.cached_transferable
     def unique_edges(self):
@@ -231,9 +236,7 @@ class Mesh:
         """
         Adjacent faces indices corresponding to each edge in `unique_edges`.
         """
-        indices = self.unique_edge_indices[0].tile((1, 2))
-        indices[:, 1] += 1
-        return self.edge_face[indices]
+        return self.edge_face[self.unique_edge_indices[2]]
 
     @vx.caching.cached
     def face_normals(self) -> torch.Tensor:
@@ -273,6 +276,23 @@ class Mesh:
         indices = self.faces.type(torch.int64).view(-1, 1).expand(-1, 3)
         normals = torch.zeros_like(self.vertices).scatter_add(-2, indices, scalars)
         return torch.nn.functional.normalize(normals)
+
+    @vx.caching.cached
+    def vertex_areas(self) -> torch.Tensor:
+        """
+        The total face surface area contributed to each vertex.
+        """
+        area_contributions = self.face_areas.unsqueeze(-1) * self.face_angles / torch.pi
+        source = area_contributions.view(-1)
+        indices = self.faces.view(-1).long()
+        zeros = torch.zeros(self.num_vertices, dtype=self.vertices.dtype, device=self.device)
+        return zeros.scatter_reduce(0, indices, source, reduce='sum', include_self=False)
+
+    def flip_faces(self) -> vx.Mesh:
+        """
+        Flip triangular face directions.
+        """
+        return vx.Mesh(self.vertices, self.faces.flip(-1))
 
     def gather(self, features: torch.Tensor, reduce: str = 'mean') -> torch.Tensor:
         """
@@ -347,9 +367,9 @@ class Mesh:
 
         # expand (or shrink) margin around border
         if margin is not None:
-            threes = margin.shape == (3,)
-            min_point -= margin if threes else margin[0]
-            min_point += margin if threes else margin[1]
+            margin = vx.slicing.conform_coordinates(margin, 2)
+            min_point -= margin[:, 0]
+            max_point += margin[:, 1]
 
         return construct_box_mesh(min_point, max_point)
 

@@ -1,4 +1,4 @@
-__version__ = '0.0.1'
+__version__ = '0.1.1'
 
 from . import caching
 from . import slicing
@@ -10,6 +10,10 @@ from .space import Space
 from . import affine
 from .affine import AffineMatrix
 from .affine import AffineVolumeTransform
+
+from . import bounds
+from .bounds import BoundingBox
+from .bounds import load_bounding_box
 
 from . import acquisition
 from .acquisition import AcquisitionGeometry
@@ -29,3 +33,5 @@ from .io.volume import load_volume
 from .io.volume import save_volume
 from .io.mesh import load_mesh
 from .io.mesh import save_mesh
+from .io.affine import load_affine
+from .io.affine import save_affine
